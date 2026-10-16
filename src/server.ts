@@ -3,8 +3,17 @@ import { app } from "./app.js";
 
 try {
     process.loadEnvFile();
-} catch {
-    // Environment variables can be provided externally or via .env file
+} catch (error: unknown) {
+    if (
+        !(
+            typeof error === "object" &&
+            error !== null &&
+            "code" in error &&
+            error.code === "ENOENT"
+        )
+    ) {
+        throw error;
+    }
 }
 
 const secret = process.env.JWT_SECRET;

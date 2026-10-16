@@ -1,5 +1,6 @@
 
 import { app } from "./app.js";
+import { initializeDatabase } from "./db/index.js";
 
 try {
     process.loadEnvFile();
@@ -24,8 +25,23 @@ if (!secret || Buffer.byteLength(secret) < 32) {
     );
 }
 
+if (!process.env.MYSQL_HOST) {
+    throw new Error(
+        "MYSQL_HOST environment variable must be set in .env",
+    );
+}
+
 const port = Number(process.env.PORT) || 3000;
 
-app.listen(port, () => {
-    console.log(`Server running on port ${port}`);
+async function startServer() {
+    await initializeDatabase();
+
+    app.listen(port, () => {
+        console.log(`Server running on port ${port}`);
+    });
+}
+
+startServer().catch((error) => {
+    console.error("Failed to start server:", error);
+    process.exit(1);
 });

@@ -1,8 +1,32 @@
-
 import { describe, expect, it } from "vitest";
 import request from "supertest";
 import express from "express";
+import jwt from "jsonwebtoken";
 import { app, errorHandler } from "../src/app.js";
+
+const testSecret = "test-secret-for-jwt-tests-at-least-32-bytes";
+process.env.JWT_SECRET = testSecret;
+
+const tokenFor = (userId: string) =>
+    jwt.sign({ sub: userId }, testSecret, {
+        algorithm: "HS256",
+        expiresIn: "1h",
+    });
+
+const getAs = (path: string, userId = "alice") =>
+    request(app)
+        .get(path)
+        .set("Authorization", `Bearer ${tokenFor(userId)}`);
+
+const postAs = (
+    path: string,
+    body: unknown,
+    userId = "alice",
+) =>
+    request(app)
+        .post(path)
+        .set("Authorization", `Bearer ${tokenFor(userId)}`)
+        .send(body as any);
 
 describe("Task API validation", () => {
     it("returns a successful health check", async () => {
@@ -13,9 +37,9 @@ describe("Task API validation", () => {
     });
 
     it("creates a task with a trimmed title", async () => {
-        const response = await request(app)
-            .post("/tasks")
-            .send({ title: " Learn TypeScript " });
+        const response = await postAs("/tasks", {
+            title: " Learn TypeScript ",
+        });
 
         expect(response.status).toBe(201);
         expect(response.body.title).toBe("Learn TypeScript");
@@ -32,13 +56,11 @@ describe("Task API validation", () => {
             { title: "   " },
         ];
 
-        const before = await request(app).get("/tasks");
+        const before = await getAs("/tasks");
         const countBefore = before.body.length;
 
         for (const body of invalidBodies) {
-            const response = await request(app)
-                .post("/tasks")
-                .send(body);
+            const response = await postAs("/tasks", body);
 
             expect(response.status).toBe(400);
             expect(response.body.error).toBe("Invalid task data");
@@ -49,16 +71,14 @@ describe("Task API validation", () => {
             );
         }
 
-        const after = await request(app).get("/tasks");
+        const after = await getAs("/tasks");
         expect(after.body).toHaveLength(countBefore);
     });
 
     it("accepts a title of exactly 200 characters", async () => {
         const title = "a".repeat(200);
 
-        const response = await request(app)
-            .post("/tasks")
-            .send({ title });
+        const response = await postAs("/tasks", { title });
 
         expect(response.status).toBe(201);
         expect(response.body.title).toBe(title);
@@ -68,32 +88,28 @@ describe("Task API validation", () => {
     it("trims whitespace before checking the 200-character limit", async () => {
         const title = ` ${"a".repeat(200)} `;
 
-        const response = await request(app)
-            .post("/tasks")
-            .send({ title });
+        const response = await postAs("/tasks", { title });
 
         expect(response.status).toBe(201);
         expect(response.body.title).toBe("a".repeat(200));
     });
 
     it("rejects titles longer than 200 characters", async () => {
-        const response = await request(app)
-            .post("/tasks")
-            .send({ title: "a".repeat(201) });
+        const response = await postAs("/tasks", {
+            title: "a".repeat(201),
+        });
 
         expect(response.status).toBe(400);
     });
 
     it("creates a task and retrieves it by its ID", async () => {
-        const created = await request(app)
-            .post("/tasks")
-            .send({ title: "Fetch this task" });
+        const created = await postAs("/tasks", {
+            title: "Fetch this task",
+        });
 
         expect(created.status).toBe(201);
 
-        const fetched = await request(app).get(
-            `/tasks/${created.body.id}`,
-        );
+        const fetched = await getAs(`/tasks/${created.body.id}`);
 
         expect(fetched.status).toBe(200);
         expect(fetched.body.id).toBe(created.body.id);
@@ -113,7 +129,7 @@ describe("Task API validation", () => {
         ];
 
         for (const id of invalidIds) {
-            const response = await request(app).get(`/tasks/${id}`);
+            const response = await getAs(`/tasks/${id}`);
 
             expect(response.status, `ID: ${id}`).toBe(400);
             expect(response.body.error).toBe("Invalid task ID");
@@ -121,7 +137,7 @@ describe("Task API validation", () => {
     });
 
     it("returns 404 for a valid but nonexistent task ID", async () => {
-        const response = await request(app).get("/tasks/999999");
+        const response = await getAs("/tasks/999999");
 
         expect(response.status).toBe(404);
         expect(response.body.error).toBe("Task not found");
@@ -137,6 +153,7 @@ describe("Task API validation", () => {
     it("returns 400 for malformed JSON", async () => {
         const response = await request(app)
             .post("/tasks")
+            .set("Authorization", `Bearer ${tokenFor("alice")}`)
             .set("Content-Type", "application/json")
             .send('{"title":');
 
@@ -147,6 +164,7 @@ describe("Task API validation", () => {
     it("preserves the 413 status for oversized JSON bodies", async () => {
         const response = await request(app)
             .post("/tasks")
+            .set("Authorization", `Bearer ${tokenFor("alice")}`)
             .send({ title: "a".repeat(1024 * 1024) });
 
         expect(response.status).toBe(413);
@@ -177,5 +195,60 @@ describe("Task API validation", () => {
         expect(response.body).toEqual({
             error: "Internal server error",
         });
+    });
+
+    it("rejects requests without credentials", async () => {
+        const response = await request(app).get("/tasks");
+
+        expect(response.status).toBe(401);
+        expect(response.body.error).toBe("Authentication required");
+    });
+
+    it("rejects an invalid JWT", async () => {
+        const response = await request(app)
+            .get("/tasks")
+            .set("Authorization", "Bearer invalid.token.value");
+
+        expect(response.status).toBe(401);
+        expect(response.body.error).toBe("Invalid authentication token");
+    });
+
+    it("does not expose another user's tasks", async () => {
+        const created = await postAs("/tasks", {
+            title: "Alice private task",
+        }, "alice");
+
+        expect(created.status).toBe(201);
+
+        const aliceList = await getAs("/tasks", "alice");
+        const bobList = await getAs("/tasks", "bob");
+
+        expect(aliceList.body.some(
+            (task: { id: number }) => task.id === created.body.id,
+        )).toBe(true);
+
+        expect(bobList.body).not.toContainEqual(
+            expect.objectContaining({ id: created.body.id }),
+        );
+
+        const bobFetch = await getAs(
+            `/tasks/${created.body.id}`,
+            "bob",
+        );
+
+        expect(bobFetch.status).toBe(404);
+        expect(bobFetch.body).toEqual({ error: "Task not found" });
+    });
+
+    it("does not return the internal owner ID in task responses", async () => {
+        const created = await postAs("/tasks", {
+            title: "Private metadata",
+        });
+
+        expect(created.status).toBe(201);
+        expect(created.body).not.toHaveProperty("ownerId");
+
+        const fetched = await getAs(`/tasks/${created.body.id}`);
+        expect(fetched.body).not.toHaveProperty("ownerId");
     });
 });

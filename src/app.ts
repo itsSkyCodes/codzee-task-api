@@ -1,6 +1,8 @@
 
+import jwt from "jsonwebtoken";
 import express, {
     type ErrorRequestHandler,
+    type RequestHandler,
 } from "express";
 import { z } from "zod";
 
@@ -12,6 +14,7 @@ interface Task {
     id: number;
     title: string;
     completed: boolean;
+    ownerId: string;
 }
 
 const tasks: Task[] = [];
@@ -28,15 +31,69 @@ const taskIdSchema = z
     .transform(Number)
     .refine(Number.isSafeInteger);
 
+export const requireAuth: RequestHandler = (req, res, next) => {
+    const authorization = req.get("authorization");
+    const match = authorization?.match(/^Bearer\s+(\S+)$/i);
+
+    if (!match) {
+        res.set("WWW-Authenticate", "Bearer");
+        return res.status(401).json({
+            error: "Authentication required",
+        });
+    }
+
+    const secret = process.env.JWT_SECRET;
+
+    if (!secret || Buffer.byteLength(secret) < 32) {
+        console.error(
+            "JWT_SECRET environment variable must be set and at least 32 bytes",
+        );
+        return res.status(500).json({
+            error: "Internal server error",
+        });
+    }
+
+    try {
+        const payload = jwt.verify(match[1]!, secret, {
+            algorithms: ["HS256"],
+        });
+
+        if (
+            typeof payload === "string" ||
+            typeof payload.sub !== "string" ||
+            payload.sub.trim().length === 0 ||
+            typeof payload.exp !== "number"
+        ) {
+            res.set("WWW-Authenticate", "Bearer");
+            return res.status(401).json({
+                error: "Invalid authentication token",
+            });
+        }
+
+        res.locals.userId = payload.sub;
+        return next();
+    } catch {
+        res.set("WWW-Authenticate", "Bearer");
+        return res.status(401).json({
+            error: "Invalid authentication token",
+        });
+    }
+};
+
 app.get("/health", (_req, res) => {
     res.json({ status: "ok" });
 });
 
-app.get("/tasks", (_req, res) => {
-    res.json(tasks);
+app.get("/tasks", requireAuth, (_req, res) => {
+    const userId = res.locals.userId as string;
+    const userTasks = tasks
+        .filter((task) => task.ownerId === userId)
+        .map(({ id, title, completed }) => ({ id, title, completed }));
+
+    return res.json(userTasks);
 });
 
-app.post("/tasks", (req, res) => {
+app.post("/tasks", requireAuth, (req, res) => {
     const result = createTaskSchema.safeParse(req.body);
 
     if (!result.success) {
@@ -53,27 +110,42 @@ app.post("/tasks", (req, res) => {
         id: nextId++,
         title: result.data.title,
         completed: false,
+        ownerId: res.locals.userId as string,
     };
 
     tasks.push(task);
 
-    return res.status(201).json(task);
+    return res.status(201).json({
+        id: task.id,
+        title: task.title,
+        completed: task.completed,
+    });
 });
 
-app.get("/tasks/:id", (req, res) => {
+app.get("/tasks/:id", requireAuth, (req, res) => {
     const idResult = taskIdSchema.safeParse(req.params.id);
 
     if (!idResult.success) {
         return res.status(400).json({ error: "Invalid task ID" });
     }
 
-    const task = tasks.find((item) => item.id === idResult.data);
+    const userId = res.locals.userId as string;
+    const task = tasks.find(
+        (item) =>
+            item.id === idResult.data &&
+            item.ownerId === userId,
+    );
 
+    // Do not reveal whether another user's task exists.
     if (!task) {
         return res.status(404).json({ error: "Task not found" });
     }
 
-    return res.json(task);
+    return res.json({
+        id: task.id,
+        title: task.title,
+        completed: task.completed,
+    });
 });
 
 // Return JSON for unknown paths and unsupported routes.

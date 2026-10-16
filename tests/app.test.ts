@@ -431,7 +431,7 @@ describe("Task API validation", () => {
             expect(response.headers["x-page"]).toBe("100");
         });
 
-        it("returns all tasks unpaginated when page and limit are omitted (backward compatible)", async () => {
+        it("defaults to page 1 and limit 20 with pagination headers when page and limit are omitted", async () => {
             const user = "all_tasks_user";
             for (let i = 1; i <= 25; i++) {
                 await postAs("/tasks", { title: `Task ${i}` }, user);
@@ -439,10 +439,11 @@ describe("Task API validation", () => {
 
             const response = await getAs("/tasks", user);
             expect(response.status).toBe(200);
-            expect(response.body).toHaveLength(25);
+            expect(response.body).toHaveLength(20);
             expect(response.headers["x-total-count"]).toBe("25");
-            expect(response.headers["x-page"]).toBeUndefined();
-            expect(response.headers["x-limit"]).toBeUndefined();
+            expect(response.headers["x-page"]).toBe("1");
+            expect(response.headers["x-limit"]).toBe("20");
+            expect(response.headers["x-total-pages"]).toBe("2");
             for (const item of response.body) {
                 expect(item).not.toHaveProperty("version");
                 expect(item).toHaveProperty("id");
@@ -608,9 +609,14 @@ describe("Task API validation", () => {
             );
         });
 
-        it("rejects updates with invalid version", async () => {
+        it("rejects updates with missing or invalid version", async () => {
             const created = await postAs("/tasks", { title: "Version Validation" });
             const taskId = created.body.id;
+
+            const missingVersion = await patchAs(`/tasks/${taskId}`, {
+                title: "No version",
+            });
+            expect(missingVersion.status).toBe(400);
 
             const nonIntegerVersion = await patchAs(`/tasks/${taskId}`, {
                 title: "Float version",
@@ -623,6 +629,22 @@ describe("Task API validation", () => {
                 version: 0,
             });
             expect(zeroVersion.status).toBe(400);
+        });
+
+        it("accepts version supplied via If-Match header when omitted from body", async () => {
+            const created = await postAs("/tasks", { title: "Header Version Test" });
+            const taskId = created.body.id;
+
+            const updateRes = await request(app)
+                .patch(`/tasks/${taskId}`)
+                .set("Authorization", `Bearer ${tokenFor("alice")}`)
+                .set("If-Match", '"1"')
+                .send({ title: "Updated via Header" });
+
+            expect(updateRes.status).toBe(200);
+            expect(updateRes.headers.etag).toBe('"2"');
+            expect(updateRes.body.title).toBe("Updated via Header");
+            expect(updateRes.body).not.toHaveProperty("version");
         });
 
         it("rejects updates with empty body or invalid fields", async () => {

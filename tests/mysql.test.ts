@@ -124,43 +124,6 @@ describe("MySqlTaskRepository query and index handling", () => {
         expect(result.tasks[0]?.completed).toBe(false);
     });
 
-    it("queries all records without LIMIT/OFFSET when pagination is omitted within a transaction", async () => {
-        let querySql = "";
-        let queryParams: any[] = [];
-        const beginTransaction = vi.fn();
-        const commit = vi.fn();
-        const release = vi.fn();
-
-        const mockConnection = {
-            beginTransaction,
-            commit,
-            rollback: vi.fn(),
-            release,
-            execute: vi.fn(async () => [[{ total: 5 }]]),
-            query: vi.fn(async (sql: string, params: any[]) => {
-                querySql = sql;
-                queryParams = params;
-                return [[{ id: 1, title: "T1", completed: 0, ownerId: "bob", version: 1 }]];
-            }),
-        };
-
-        const mockPool = {
-            getConnection: vi.fn(async () => mockConnection),
-        };
-
-        const repo = new MySqlTaskRepository(mockPool as any);
-        const result = await repo.findMany({ ownerId: "bob" });
-
-        expect(beginTransaction).toHaveBeenCalledOnce();
-        expect(commit).toHaveBeenCalledOnce();
-        expect(release).toHaveBeenCalledOnce();
-
-        expect(querySql).toContain("ORDER BY id ASC");
-        expect(querySql).not.toContain("LIMIT");
-        expect(queryParams).toEqual(["bob"]);
-        expect(result.tasks).toHaveLength(1);
-    });
-
     it("short-circuits and skips SELECT query when offset exceeds total count", async () => {
         const query = vi.fn();
         const mockConnection = {
@@ -309,8 +272,14 @@ describe("MySqlTaskRepository query and index handling", () => {
         expect(result.status).toBe("NOT_FOUND");
     });
 
-    it("updates successfully even when MySQL driver returns affectedRows = 0 (changed rows vs matched rows)", async () => {
-        let updateExecuted = false;
+    it("asserts ETag header and omission of version from response body on HTTP update", async () => {
+        let previousRepo: any = null;
+        try {
+            previousRepo = getTaskRepository();
+        } catch {
+            // In case it wasn't initialized yet
+        }
+
         const mockConnection = {
             beginTransaction: vi.fn(),
             commit: vi.fn(),
@@ -322,7 +291,7 @@ describe("MySqlTaskRepository query and index handling", () => {
                         [
                             {
                                 id: 42,
-                                title: "Same Title",
+                                title: "Task 42",
                                 completed: 0,
                                 ownerId: "carol",
                                 version: 1,
@@ -331,9 +300,7 @@ describe("MySqlTaskRepository query and index handling", () => {
                     ];
                 }
                 if (sql.startsWith("UPDATE")) {
-                    updateExecuted = true;
-                    // MySQL default behavior when updated fields match existing values: affectedRows (changed) = 0
-                    return [{ affectedRows: 0 }];
+                    return [{ affectedRows: 1 }];
                 }
                 return [[]];
             }),
@@ -343,18 +310,41 @@ describe("MySqlTaskRepository query and index handling", () => {
             getConnection: vi.fn(async () => mockConnection),
         };
 
-        const repo = new MySqlTaskRepository(mockPool as any);
-        const result = await repo.update(42, "carol", {
-            title: "Same Title",
-            version: 1,
-        });
+        try {
+            const repo = new MySqlTaskRepository(mockPool as any);
+            setTaskRepository(repo);
 
-        expect(updateExecuted).toBe(true);
-        expect(result.status).toBe("SUCCESS");
-        if (result.status === "SUCCESS") {
-            expect(result.task.id).toBe(42);
-            expect(result.task.version).toBe(2);
-            expect(result.task.title).toBe("Same Title");
+            const token = jwt.sign({ sub: "carol" }, testJwtSecret, {
+                algorithm: "HS256",
+                expiresIn: "1h",
+            });
+
+            // Updating via PATCH should return 200 with ETag header and no version in body
+            const res = await request(app)
+                .patch("/tasks/42")
+                .set("Authorization", `Bearer ${token}`)
+                .set("If-Match", '"1"')
+                .send({ title: "New Title", completed: true });
+
+            expect(res.status).toBe(200);
+            expect(res.headers.etag).toBe('"2"');
+            expect(res.body).toEqual({
+                id: 42,
+                title: "New Title",
+                completed: true,
+            });
+            expect(res.body).not.toHaveProperty("version");
+
+            // Updating without version in body or If-Match header must be rejected with 400
+            const missingVersionRes = await request(app)
+                .patch("/tasks/42")
+                .set("Authorization", `Bearer ${token}`)
+                .send({ title: "Missing Version" });
+
+            expect(missingVersionRes.status).toBe(400);
+            expect(missingVersionRes.body.error).toBe("Invalid task data");
+        } finally {
+            setTaskRepository(previousRepo);
         }
     });
 
@@ -427,7 +417,7 @@ describe.runIf(isRealMySqlAvailable)(
             createdTaskId = created.id;
         });
 
-        it("updates task with identical values and increments version (exercises MySQL changed rows vs matched rows)", async () => {
+        it("updates task with identical values and increments version atomically in a transaction", async () => {
             const result = await repo.update(createdTaskId, testOwner, {
                 title: "Integration Task",
                 version: 1,
@@ -497,6 +487,7 @@ describe.runIf(isRealMySqlAvailable)(
                     .set("Authorization", `Bearer ${token}`);
                 expect(getRes.status).toBe(200);
                 expect(getRes.headers.etag).toBe('"3"');
+                expect(getRes.body).not.toHaveProperty("version");
 
                 // Successful patch with matching If-Match header
                 const patchRes1 = await request(app)
@@ -508,6 +499,7 @@ describe.runIf(isRealMySqlAvailable)(
                 expect(patchRes1.status).toBe(200);
                 expect(patchRes1.headers.etag).toBe('"4"');
                 expect(patchRes1.body.title).toBe("HTTP patched title");
+                expect(patchRes1.body).not.toHaveProperty("version");
 
                 // Stale patch with previous If-Match header
                 const patchRes2 = await request(app)

@@ -46,17 +46,17 @@ const paginationQuerySchema = z.object({
     page: z
         .string()
         .regex(/^[1-9]\d*$/, "Page must be a positive integer")
+        .default("1")
         .transform(Number)
         .refine(Number.isSafeInteger, "Page must be a safe integer")
-        .refine((n) => n >= 1 && n <= 10000, "Page must be between 1 and 10000")
-        .optional(),
+        .refine((n) => n >= 1 && n <= 10000, "Page must be between 1 and 10000"),
     limit: z
         .string()
         .regex(/^[1-9]\d*$/, "Limit must be a positive integer")
+        .default("20")
         .transform(Number)
         .refine(Number.isSafeInteger, "Limit must be a safe integer")
-        .refine((n) => n >= 1 && n <= 100, "Limit must be between 1 and 100")
-        .optional(),
+        .refine((n) => n >= 1 && n <= 100, "Limit must be between 1 and 100"),
 });
 
 // Accept only canonical positive decimal integers in the URL.
@@ -120,25 +120,6 @@ app.get("/health", (_req, res) => {
 });
 
 app.get("/tasks", requireAuth, async (req, res) => {
-    const isPaginationRequested =
-        req.query.page !== undefined || req.query.limit !== undefined;
-
-    const userId = res.locals.userId as string;
-    const repository = getTaskRepository();
-
-    if (!isPaginationRequested) {
-        const result = await repository.findMany({ ownerId: userId });
-        res.set("X-Total-Count", String(result.total));
-
-        const userTasks = result.tasks.map(({ id, title, completed }) => ({
-            id,
-            title,
-            completed,
-        }));
-
-        return res.json(userTasks);
-    }
-
     const queryResult = paginationQuerySchema.safeParse(req.query);
 
     if (!queryResult.success) {
@@ -151,20 +132,19 @@ app.get("/tasks", requireAuth, async (req, res) => {
         });
     }
 
-    const page = queryResult.data.page ?? 1;
-    const limit = queryResult.data.limit ?? 20;
-
+    const userId = res.locals.userId as string;
+    const repository = getTaskRepository();
     const result = await repository.findMany({
         ownerId: userId,
-        page,
-        limit,
+        page: queryResult.data.page,
+        limit: queryResult.data.limit,
     });
 
-    const totalPages = Math.ceil(result.total / limit);
+    const totalPages = Math.ceil(result.total / queryResult.data.limit);
 
     res.set("X-Total-Count", String(result.total));
-    res.set("X-Page", String(page));
-    res.set("X-Limit", String(limit));
+    res.set("X-Page", String(queryResult.data.page));
+    res.set("X-Limit", String(queryResult.data.limit));
     res.set("X-Total-Pages", String(totalPages));
 
     const userTasks = result.tasks.map(({ id, title, completed }) => ({
@@ -251,6 +231,18 @@ app.patch("/tasks/:id", requireAuth, async (req, res) => {
     const versionFromHeader =
         ifMatch && /^[1-9]\d*$/.test(ifMatch) ? Number(ifMatch) : undefined;
     const version = bodyResult.data.version ?? versionFromHeader;
+
+    if (version === undefined) {
+        return res.status(400).json({
+            error: "Invalid task data",
+            details: [
+                {
+                    field: "version",
+                    message: "Version must be an integer",
+                },
+            ],
+        });
+    }
 
     const userId = res.locals.userId as string;
     const repository = getTaskRepository();

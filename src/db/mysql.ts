@@ -59,8 +59,8 @@ export class MySqlTaskRepository implements TaskRepository {
 
     async findMany(options: {
         ownerId: string;
-        page?: number;
-        limit?: number;
+        page: number;
+        limit: number;
     }): Promise<{ tasks: TaskRecord[]; total: number }> {
         const connection = await this.pool.getConnection();
 
@@ -75,37 +75,17 @@ export class MySqlTaskRepository implements TaskRepository {
             const total = Number(countRows[0]?.total ?? 0);
 
             let tasks: TaskRecord[] = [];
+            const offset = (options.page - 1) * options.limit;
 
-            if (options.limit !== undefined) {
-                const page = options.page ?? 1;
-                const offset = (page - 1) * options.limit;
-
-                // Optimization & safety: avoid unbounded OFFSET scan if offset is beyond total rows
-                if (offset < total) {
-                    const [rows] = await connection.query<mysql.RowDataPacket[]>(
-                        `SELECT id, title, completed, owner_id AS ownerId, version
-                         FROM tasks
-                         WHERE owner_id = ?
-                         ORDER BY id ASC
-                         LIMIT ? OFFSET ?`,
-                        [options.ownerId, options.limit, offset],
-                    );
-
-                    tasks = rows.map((row) => ({
-                        id: Number(row.id),
-                        title: String(row.title),
-                        completed: Boolean(row.completed),
-                        ownerId: String(row.ownerId),
-                        version: Number(row.version),
-                    }));
-                }
-            } else {
+            // Optimization & safety: avoid unbounded OFFSET scan if offset is beyond total rows
+            if (offset < total) {
                 const [rows] = await connection.query<mysql.RowDataPacket[]>(
                     `SELECT id, title, completed, owner_id AS ownerId, version
                      FROM tasks
                      WHERE owner_id = ?
-                     ORDER BY id ASC`,
-                    [options.ownerId],
+                     ORDER BY id ASC
+                     LIMIT ? OFFSET ?`,
+                    [options.ownerId, options.limit, offset],
                 );
 
                 tasks = rows.map((row) => ({
@@ -131,7 +111,7 @@ export class MySqlTaskRepository implements TaskRepository {
     async update(
         id: number,
         ownerId: string,
-        updates: { title?: string | undefined; completed?: boolean | undefined; version?: number | undefined },
+        updates: { title?: string | undefined; completed?: boolean | undefined; version: number },
     ): Promise<TaskUpdateResult> {
         const connection = await this.pool.getConnection();
 
@@ -155,8 +135,8 @@ export class MySqlTaskRepository implements TaskRepository {
 
             const currentVersion = Number(row.version);
 
-            // Optimistic concurrency check when version is provided
-            if (updates.version !== undefined && currentVersion !== updates.version) {
+            // Optimistic concurrency check
+            if (currentVersion !== updates.version) {
                 await connection.rollback();
                 return {
                     status: "CONFLICT",

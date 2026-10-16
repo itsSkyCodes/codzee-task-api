@@ -40,20 +40,14 @@ export class InMemoryTaskRepository implements TaskRepository {
 
     async findMany(options: {
         ownerId: string;
-        page?: number;
-        limit?: number;
+        page: number;
+        limit: number;
     }): Promise<{ tasks: TaskRecord[]; total: number }> {
         const taskIds = this.ownerIndex.get(options.ownerId) ?? [];
         const total = taskIds.length;
 
-        let selectedIds: number[];
-        if (options.limit !== undefined) {
-            const page = options.page ?? 1;
-            const offset = (page - 1) * options.limit;
-            selectedIds = taskIds.slice(offset, offset + options.limit);
-        } else {
-            selectedIds = taskIds;
-        }
+        const offset = (options.page - 1) * options.limit;
+        const selectedIds = taskIds.slice(offset, offset + options.limit);
 
         const tasks: TaskRecord[] = [];
         for (const id of selectedIds) {
@@ -69,7 +63,7 @@ export class InMemoryTaskRepository implements TaskRepository {
     async update(
         id: number,
         ownerId: string,
-        updates: { title?: string | undefined; completed?: boolean | undefined; version?: number | undefined },
+        updates: { title?: string | undefined; completed?: boolean | undefined; version: number },
     ): Promise<TaskUpdateResult> {
         const record = this.tasks.get(id);
 
@@ -77,8 +71,8 @@ export class InMemoryTaskRepository implements TaskRepository {
             return { status: "NOT_FOUND" };
         }
 
-        // Optimistic concurrency control check when version is provided
-        if (updates.version !== undefined && record.version !== updates.version) {
+        // Optimistic concurrency control check
+        if (record.version !== updates.version) {
             return {
                 status: "CONFLICT",
                 currentVersion: record.version,

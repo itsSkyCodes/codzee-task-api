@@ -18,12 +18,12 @@ export interface TaskRepository {
     findById(id: number, ownerId: string): Promise<TaskRecord | null>;
     findMany(options: {
         ownerId: string;
-        page?: number;
-        limit?: number;
+        page: number;
+        limit: number;
     }): Promise<{ tasks: TaskRecord[]; total: number }>;
     update(
         id: number,
         ownerId: string,
-        updates: { title?: string | undefined; completed?: boolean | undefined; version?: number | undefined },
+        updates: { title?: string | undefined; completed?: boolean | undefined; version: number },
     ): Promise<TaskUpdateResult>;
 }

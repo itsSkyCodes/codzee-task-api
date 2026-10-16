@@ -1,7 +1,8 @@
 
 import { describe, expect, it } from "vitest";
 import request from "supertest";
-import { app } from "../src/app.js";
+import express from "express";
+import { app, errorHandler } from "../src/app.js";
 
 describe("Task API validation", () => {
     it("returns a successful health check", async () => {
@@ -150,5 +151,31 @@ describe("Task API validation", () => {
 
         expect(response.status).toBe(413);
         expect(response.body.error).toBe("Request body too large");
+    });
+
+    it("returns a JSON client error for malformed URL-encoded task IDs", async () => {
+        const response = await request(app).get("/tasks/%E0%A4%A");
+
+        expect(response.status).toBe(400);
+        expect(response.body).toEqual({
+            error: "Invalid request",
+        });
+    });
+
+    it("returns a generic 500 response for unexpected errors", async () => {
+        const errorApp = express();
+
+        errorApp.get("/trigger-error", (_req, _res, next) => {
+            next(new Error("Unexpected test error"));
+        });
+
+        errorApp.use(errorHandler);
+
+        const response = await request(errorApp).get("/trigger-error");
+
+        expect(response.status).toBe(500);
+        expect(response.body).toEqual({
+            error: "Internal server error",
+        });
     });
 });

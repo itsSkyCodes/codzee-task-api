@@ -82,7 +82,7 @@ app.use((_req, res) => {
 });
 
 // Preserve appropriate 4xx statuses from Express/body-parser.
-const errorHandler: ErrorRequestHandler = (
+export const errorHandler: ErrorRequestHandler = (
     err: unknown,
     _req,
     res,

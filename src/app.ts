@@ -1,6 +1,7 @@
 
-import express from "express";
-import type { NextFunction, Request, Response } from "express";
+import express, {
+    type ErrorRequestHandler,
+} from "express";
 import { z } from "zod";
 
 export const app = express();
@@ -20,7 +21,12 @@ const createTaskSchema = z.object({
     title: z.string().trim().min(1).max(200),
 });
 
-const taskIdSchema = z.coerce.number().int().positive();
+// Accept only canonical positive decimal integers in the URL.
+const taskIdSchema = z
+    .string()
+    .regex(/^[1-9]\d*$/)
+    .transform(Number)
+    .refine(Number.isSafeInteger);
 
 app.get("/health", (_req, res) => {
     res.json({ status: "ok" });
@@ -50,6 +56,7 @@ app.post("/tasks", (req, res) => {
     };
 
     tasks.push(task);
+
     return res.status(201).json(task);
 });
 
@@ -69,22 +76,51 @@ app.get("/tasks/:id", (req, res) => {
     return res.json(task);
 });
 
-// Return consistent errors without exposing internal details.
-app.use(
-    (
-        err: unknown,
-        _req: Request,
-        res: Response,
-        _next: NextFunction
-    ) => {
-        if (
-            err instanceof SyntaxError &&
-            "status" in err &&
-            err.status === 400
-        ) {
-            return res.status(400).json({ error: "Invalid JSON body" });
-        }
+// Return JSON for unknown paths and unsupported routes.
+app.use((_req, res) => {
+    return res.status(404).json({ error: "Not found" });
+});
 
-        return res.status(500).json({ error: "Internal server error" });
+// Preserve appropriate 4xx statuses from Express/body-parser.
+const errorHandler: ErrorRequestHandler = (
+    err: unknown,
+    _req,
+    res,
+    _next,
+) => {
+    if (
+        err instanceof SyntaxError &&
+        "body" in err
+    ) {
+        return res.status(400).json({
+            error: "Invalid JSON body",
+        });
     }
-);
+
+    const error =
+        typeof err === "object" && err !== null
+            ? (err as { status?: unknown; statusCode?: unknown })
+            : {};
+
+    const status = error.status ?? error.statusCode;
+
+    if (
+        typeof status === "number" &&
+        Number.isInteger(status) &&
+        status >= 400 &&
+        status < 500
+    ) {
+        return res.status(status).json({
+            error:
+                status === 413
+                    ? "Request body too large"
+                    : "Invalid request",
+        });
+    }
+
+    return res.status(500).json({
+        error: "Internal server error",
+    });
+};
+
+app.use(errorHandler);

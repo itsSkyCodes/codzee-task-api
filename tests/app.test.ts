@@ -197,17 +197,113 @@ describe("Task API validation", () => {
         });
     });
 
-    it("rejects requests without credentials", async () => {
-        const response = await request(app).get("/tasks");
+    const taskEndpoints = [
+        {
+            method: "GET",
+            path: "/tasks",
+            makeRequest: () => request(app).get("/tasks"),
+        },
+        {
+            method: "POST",
+            path: "/tasks",
+            makeRequest: () =>
+                request(app)
+                    .post("/tasks")
+                    .send({ title: "Unauthorized task" }),
+        },
+        {
+            method: "GET",
+            path: "/tasks/1",
+            makeRequest: () => request(app).get("/tasks/1"),
+        },
+    ];
 
-        expect(response.status).toBe(401);
-        expect(response.body.error).toBe("Authentication required");
-    });
+    it.each(taskEndpoints)(
+        "rejects $method $path without credentials",
+        async ({ makeRequest }) => {
+            const response = await makeRequest();
+
+            expect(response.status).toBe(401);
+            expect(response.headers["www-authenticate"]).toBe("Bearer");
+            expect(response.body).toEqual({
+                error: "Authentication required",
+            });
+        },
+    );
+
+    it.each(taskEndpoints)(
+        "rejects $method $path with non-Bearer credentials",
+        async ({ makeRequest }) => {
+            const response = await makeRequest().set(
+                "Authorization",
+                "Basic xyz",
+            );
+
+            expect(response.status).toBe(401);
+            expect(response.headers["www-authenticate"]).toBe("Bearer");
+            expect(response.body).toEqual({
+                error: "Authentication required",
+            });
+        },
+    );
 
     it("rejects an invalid JWT", async () => {
         const response = await request(app)
             .get("/tasks")
             .set("Authorization", "Bearer invalid.token.value");
+
+        expect(response.status).toBe(401);
+        expect(response.headers["www-authenticate"]).toBe("Bearer");
+        expect(response.body).toEqual({
+            error: "Invalid authentication token",
+        });
+    });
+
+    it("rejects a validly signed token without an expiration claim", async () => {
+        const tokenWithoutExp = jwt.sign({ sub: "alice" }, testSecret, {
+            algorithm: "HS256",
+        });
+
+        const response = await request(app)
+            .get("/tasks")
+            .set("Authorization", `Bearer ${tokenWithoutExp}`);
+
+        expect(response.status).toBe(401);
+        expect(response.body.error).toBe("Invalid authentication token");
+    });
+
+    it("rejects a validly signed token with a blank, missing, or non-string subject", async () => {
+        const invalidSubPayloads: Array<Record<string, unknown>> = [
+            {},
+            { sub: "" },
+            { sub: "   " },
+            { sub: 123 },
+            { sub: null },
+        ];
+
+        for (const payload of invalidSubPayloads) {
+            const token = jwt.sign(payload, testSecret, {
+                algorithm: "HS256",
+                expiresIn: "1h",
+            });
+
+            const response = await request(app)
+                .get("/tasks")
+                .set("Authorization", `Bearer ${token}`);
+
+            expect(response.status).toBe(401);
+            expect(response.body.error).toBe("Invalid authentication token");
+        }
+    });
+
+    it("rejects a validly signed token with a string payload", async () => {
+        const token = jwt.sign("literal-string", testSecret, {
+            algorithm: "HS256",
+        });
+
+        const response = await request(app)
+            .get("/tasks")
+            .set("Authorization", `Bearer ${token}`);
 
         expect(response.status).toBe(401);
         expect(response.body.error).toBe("Invalid authentication token");
@@ -250,5 +346,11 @@ describe("Task API validation", () => {
 
         const fetched = await getAs(`/tasks/${created.body.id}`);
         expect(fetched.body).not.toHaveProperty("ownerId");
+
+        const list = await getAs("/tasks");
+        expect(list.body.length).toBeGreaterThan(0);
+        for (const item of list.body) {
+            expect(item).not.toHaveProperty("ownerId");
+        }
     });
 });

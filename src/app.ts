@@ -45,6 +45,9 @@ export const requireAuth: RequestHandler = (req, res, next) => {
     const secret = process.env.JWT_SECRET;
 
     if (!secret || Buffer.byteLength(secret) < 32) {
+        console.error(
+            "JWT_SECRET environment variable must be set and at least 32 bytes",
+        );
         return res.status(500).json({
             error: "Internal server error",
         });

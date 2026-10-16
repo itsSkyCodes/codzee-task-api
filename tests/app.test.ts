@@ -268,6 +268,40 @@ describe("Task API validation", () => {
         },
     );
 
+    it("rejects PATCH /tasks/:id without credentials even with invalid body or invalid ID (verifying auth precedes validation)", async () => {
+        const emptyBodyRes = await request(app)
+            .patch("/tasks/1")
+            .send({});
+
+        expect(emptyBodyRes.status).toBe(401);
+        expect(emptyBodyRes.headers["www-authenticate"]).toBe("Bearer");
+        expect(emptyBodyRes.body).toEqual({
+            error: "Authentication required",
+        });
+
+        const invalidIdRes = await request(app)
+            .patch("/tasks/abc")
+            .send({ title: "" });
+
+        expect(invalidIdRes.status).toBe(401);
+        expect(invalidIdRes.headers["www-authenticate"]).toBe("Bearer");
+        expect(invalidIdRes.body).toEqual({
+            error: "Authentication required",
+        });
+    });
+
+    it("rejects POST /tasks without credentials even with invalid body (verifying auth precedes validation)", async () => {
+        const invalidBodyRes = await request(app)
+            .post("/tasks")
+            .send({ title: "" });
+
+        expect(invalidBodyRes.status).toBe(401);
+        expect(invalidBodyRes.headers["www-authenticate"]).toBe("Bearer");
+        expect(invalidBodyRes.body).toEqual({
+            error: "Authentication required",
+        });
+    });
+
     it("rejects an invalid JWT", async () => {
         const response = await request(app)
             .get("/tasks")
@@ -377,7 +411,7 @@ describe("Task API validation", () => {
 
     describe("Pagination and database querying", () => {
         it("returns an empty list with correct headers for a user with no tasks", async () => {
-            const response = await getAs("/tasks", "new_user_with_no_tasks");
+            const response = await getAs("/tasks?page=1", "new_user_with_no_tasks");
 
             expect(response.status).toBe(200);
             expect(response.body).toEqual([]);
@@ -397,6 +431,26 @@ describe("Task API validation", () => {
             expect(response.headers["x-page"]).toBe("100");
         });
 
+        it("returns all tasks unpaginated when page and limit are omitted (backward compatible)", async () => {
+            const user = "all_tasks_user";
+            for (let i = 1; i <= 25; i++) {
+                await postAs("/tasks", { title: `Task ${i}` }, user);
+            }
+
+            const response = await getAs("/tasks", user);
+            expect(response.status).toBe(200);
+            expect(response.body).toHaveLength(25);
+            expect(response.headers["x-total-count"]).toBe("25");
+            expect(response.headers["x-page"]).toBeUndefined();
+            expect(response.headers["x-limit"]).toBeUndefined();
+            for (const item of response.body) {
+                expect(item).not.toHaveProperty("version");
+                expect(item).toHaveProperty("id");
+                expect(item).toHaveProperty("title");
+                expect(item).toHaveProperty("completed");
+            }
+        });
+
         it("paginates correctly across page boundaries", async () => {
             const user = "pagination_stepper";
             const taskIds: number[] = [];
@@ -412,6 +466,7 @@ describe("Task API validation", () => {
             expect(page1.body).toHaveLength(2);
             expect(page1.body[0].id).toBe(taskIds[0]);
             expect(page1.body[1].id).toBe(taskIds[1]);
+            expect(page1.body[0]).not.toHaveProperty("version");
             expect(page1.headers["x-total-count"]).toBe("5");
             expect(page1.headers["x-page"]).toBe("1");
             expect(page1.headers["x-limit"]).toBe("2");
@@ -454,6 +509,7 @@ describe("Task API validation", () => {
                 "/tasks?page=-1",
                 "/tasks?page=abc",
                 "/tasks?page=1.5",
+                "/tasks?page=10001",
                 "/tasks?limit=0",
                 "/tasks?limit=-5",
                 "/tasks?limit=101",
@@ -473,7 +529,8 @@ describe("Task API validation", () => {
         it("successfully updates task title and completion status with matching version", async () => {
             const created = await postAs("/tasks", { title: "Original Title" });
             expect(created.status).toBe(201);
-            expect(created.body.version).toBe(1);
+            expect(created.body).not.toHaveProperty("version");
+            expect(created.headers.etag).toBe('"1"');
 
             const updated = await patchAs(`/tasks/${created.body.id}`, {
                 title: "Updated Title",
@@ -484,14 +541,16 @@ describe("Task API validation", () => {
             expect(updated.status).toBe(200);
             expect(updated.body.title).toBe("Updated Title");
             expect(updated.body.completed).toBe(true);
-            expect(updated.body.version).toBe(2);
+            expect(updated.body).not.toHaveProperty("version");
+            expect(updated.headers.etag).toBe('"2"');
 
             // Fetch to ensure database persisted the update
             const fetched = await getAs(`/tasks/${created.body.id}`);
             expect(fetched.status).toBe(200);
             expect(fetched.body.title).toBe("Updated Title");
             expect(fetched.body.completed).toBe(true);
-            expect(fetched.body.version).toBe(2);
+            expect(fetched.body).not.toHaveProperty("version");
+            expect(fetched.headers.etag).toBe('"2"');
         });
 
         it("rejects conflicting updates with a stale version (409 Conflict)", async () => {
@@ -504,7 +563,8 @@ describe("Task API validation", () => {
                 version: 1,
             });
             expect(updateA.status).toBe(200);
-            expect(updateA.body.version).toBe(2);
+            expect(updateA.body).not.toHaveProperty("version");
+            expect(updateA.headers.etag).toBe('"2"');
 
             // Client B attempts to update with stale version 1 -> rejected with 409 Conflict
             const updateB = await patchAs(`/tasks/${taskId}`, {
@@ -523,7 +583,8 @@ describe("Task API validation", () => {
                 version: 2,
             });
             expect(updateBRetry.status).toBe(200);
-            expect(updateBRetry.body.version).toBe(3);
+            expect(updateBRetry.body).not.toHaveProperty("version");
+            expect(updateBRetry.headers.etag).toBe('"3"');
         });
 
         it("rejects duplicate updates using the previous version with 409 Conflict", async () => {
@@ -547,14 +608,9 @@ describe("Task API validation", () => {
             );
         });
 
-        it("rejects updates with missing or invalid version", async () => {
+        it("rejects updates with invalid version", async () => {
             const created = await postAs("/tasks", { title: "Version Validation" });
             const taskId = created.body.id;
-
-            const missingVersion = await patchAs(`/tasks/${taskId}`, {
-                title: "No version",
-            });
-            expect(missingVersion.status).toBe(400);
 
             const nonIntegerVersion = await patchAs(`/tasks/${taskId}`, {
                 title: "Float version",
@@ -629,7 +685,7 @@ describe("Task API validation", () => {
             // Verify Alice's task was NOT changed
             const aliceTask = await getAs(`/tasks/${created.body.id}`, "alice");
             expect(aliceTask.body.title).toBe("Alice's Task");
-            expect(aliceTask.body.version).toBe(1);
+            expect(aliceTask.body).not.toHaveProperty("version");
         });
     });
 });

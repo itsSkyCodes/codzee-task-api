@@ -31,7 +31,9 @@ const updateTaskSchema = z
         version: z
             .number()
             .int("Version must be an integer")
-            .positive("Version must be a positive integer"),
+            .positive("Version must be a positive integer")
+            .refine(Number.isSafeInteger, "Version must be a safe integer")
+            .optional(),
     })
     .refine(
         (data) => data.title !== undefined || data.completed !== undefined,
@@ -44,16 +46,17 @@ const paginationQuerySchema = z.object({
     page: z
         .string()
         .regex(/^[1-9]\d*$/, "Page must be a positive integer")
-        .default("1")
         .transform(Number)
-        .refine(Number.isSafeInteger, "Page must be a safe integer"),
+        .refine(Number.isSafeInteger, "Page must be a safe integer")
+        .refine((n) => n >= 1 && n <= 10000, "Page must be between 1 and 10000")
+        .optional(),
     limit: z
         .string()
         .regex(/^[1-9]\d*$/, "Limit must be a positive integer")
-        .default("20")
         .transform(Number)
         .refine(Number.isSafeInteger, "Limit must be a safe integer")
-        .refine((n) => n >= 1 && n <= 100, "Limit must be between 1 and 100"),
+        .refine((n) => n >= 1 && n <= 100, "Limit must be between 1 and 100")
+        .optional(),
 });
 
 // Accept only canonical positive decimal integers in the URL.
@@ -117,6 +120,25 @@ app.get("/health", (_req, res) => {
 });
 
 app.get("/tasks", requireAuth, async (req, res) => {
+    const isPaginationRequested =
+        req.query.page !== undefined || req.query.limit !== undefined;
+
+    const userId = res.locals.userId as string;
+    const repository = getTaskRepository();
+
+    if (!isPaginationRequested) {
+        const result = await repository.findMany({ ownerId: userId });
+        res.set("X-Total-Count", String(result.total));
+
+        const userTasks = result.tasks.map(({ id, title, completed }) => ({
+            id,
+            title,
+            completed,
+        }));
+
+        return res.json(userTasks);
+    }
+
     const queryResult = paginationQuerySchema.safeParse(req.query);
 
     if (!queryResult.success) {
@@ -129,26 +151,26 @@ app.get("/tasks", requireAuth, async (req, res) => {
         });
     }
 
-    const userId = res.locals.userId as string;
-    const repository = getTaskRepository();
+    const page = queryResult.data.page ?? 1;
+    const limit = queryResult.data.limit ?? 20;
+
     const result = await repository.findMany({
         ownerId: userId,
-        page: queryResult.data.page,
-        limit: queryResult.data.limit,
+        page,
+        limit,
     });
 
-    const totalPages = Math.ceil(result.total / queryResult.data.limit);
+    const totalPages = Math.ceil(result.total / limit);
 
     res.set("X-Total-Count", String(result.total));
-    res.set("X-Page", String(queryResult.data.page));
-    res.set("X-Limit", String(queryResult.data.limit));
+    res.set("X-Page", String(page));
+    res.set("X-Limit", String(limit));
     res.set("X-Total-Pages", String(totalPages));
 
-    const userTasks = result.tasks.map(({ id, title, completed, version }) => ({
+    const userTasks = result.tasks.map(({ id, title, completed }) => ({
         id,
         title,
         completed,
-        version,
     }));
 
     return res.json(userTasks);
@@ -174,11 +196,11 @@ app.post("/tasks", requireAuth, async (req, res) => {
         ownerId: userId,
     });
 
+    res.set("ETag", `"${task.version}"`);
     return res.status(201).json({
         id: task.id,
         title: task.title,
         completed: task.completed,
-        version: task.version,
     });
 });
 
@@ -198,11 +220,11 @@ app.get("/tasks/:id", requireAuth, async (req, res) => {
         return res.status(404).json({ error: "Task not found" });
     }
 
+    res.set("ETag", `"${task.version}"`);
     return res.json({
         id: task.id,
         title: task.title,
         completed: task.completed,
-        version: task.version,
     });
 });
 
@@ -225,6 +247,11 @@ app.patch("/tasks/:id", requireAuth, async (req, res) => {
         });
     }
 
+    const ifMatch = req.get("if-match")?.replace(/"/g, "").trim();
+    const versionFromHeader =
+        ifMatch && /^[1-9]\d*$/.test(ifMatch) ? Number(ifMatch) : undefined;
+    const version = bodyResult.data.version ?? versionFromHeader;
+
     const userId = res.locals.userId as string;
     const repository = getTaskRepository();
     const updateResult = await repository.update(
@@ -233,7 +260,7 @@ app.patch("/tasks/:id", requireAuth, async (req, res) => {
         {
             title: bodyResult.data.title,
             completed: bodyResult.data.completed,
-            version: bodyResult.data.version,
+            version,
         },
     );
 
@@ -248,11 +275,11 @@ app.patch("/tasks/:id", requireAuth, async (req, res) => {
         });
     }
 
+    res.set("ETag", `"${updateResult.task.version}"`);
     return res.json({
         id: updateResult.task.id,
         title: updateResult.task.title,
         completed: updateResult.task.completed,
-        version: updateResult.task.version,
     });
 });
 

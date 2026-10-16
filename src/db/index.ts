@@ -31,7 +31,7 @@ export function getTaskRepository(): TaskRepository {
     return taskRepositoryInstance;
 }
 
-export function setTaskRepository(repo: TaskRepository): void {
+export function setTaskRepository(repo: TaskRepository | null): void {
     taskRepositoryInstance = repo;
 }
 

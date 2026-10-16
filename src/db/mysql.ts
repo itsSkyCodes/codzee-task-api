@@ -11,11 +11,11 @@ export class MySqlTaskRepository implements TaskRepository {
     async init(): Promise<void> {
         await this.pool.query(`
             CREATE TABLE IF NOT EXISTS tasks (
-                id INT AUTO_INCREMENT PRIMARY KEY,
+                id BIGINT AUTO_INCREMENT PRIMARY KEY,
                 title VARCHAR(200) NOT NULL,
                 completed BOOLEAN NOT NULL DEFAULT FALSE,
                 owner_id VARCHAR(255) NOT NULL,
-                version INT NOT NULL DEFAULT 1,
+                version BIGINT NOT NULL DEFAULT 1,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                 INDEX idx_owner_id_id (owner_id, id)
@@ -59,87 +59,139 @@ export class MySqlTaskRepository implements TaskRepository {
 
     async findMany(options: {
         ownerId: string;
-        page: number;
-        limit: number;
+        page?: number;
+        limit?: number;
     }): Promise<{ tasks: TaskRecord[]; total: number }> {
-        const offset = (options.page - 1) * options.limit;
+        const connection = await this.pool.getConnection();
 
-        // Use index idx_owner_id_id for both count and range scan
-        const [countRows] = await this.pool.execute<mysql.RowDataPacket[]>(
-            `SELECT COUNT(*) AS total FROM tasks WHERE owner_id = ?`,
-            [options.ownerId],
-        );
-        const total = Number(countRows[0]?.total ?? 0);
+        try {
+            await connection.beginTransaction();
 
-        const [rows] = await this.pool.query<mysql.RowDataPacket[]>(
-            `SELECT id, title, completed, owner_id AS ownerId, version
-             FROM tasks
-             WHERE owner_id = ?
-             ORDER BY id ASC
-             LIMIT ? OFFSET ?`,
-            [options.ownerId, options.limit, offset],
-        );
+            // Use index idx_owner_id_id for count within consistent snapshot
+            const [countRows] = await connection.execute<mysql.RowDataPacket[]>(
+                `SELECT COUNT(*) AS total FROM tasks WHERE owner_id = ?`,
+                [options.ownerId],
+            );
+            const total = Number(countRows[0]?.total ?? 0);
 
-        const tasks: TaskRecord[] = rows.map((row) => ({
-            id: Number(row.id),
-            title: String(row.title),
-            completed: Boolean(row.completed),
-            ownerId: String(row.ownerId),
-            version: Number(row.version),
-        }));
+            let tasks: TaskRecord[] = [];
 
-        return { tasks, total };
+            if (options.limit !== undefined) {
+                const page = options.page ?? 1;
+                const offset = (page - 1) * options.limit;
+
+                // Optimization & safety: avoid unbounded OFFSET scan if offset is beyond total rows
+                if (offset < total) {
+                    const [rows] = await connection.query<mysql.RowDataPacket[]>(
+                        `SELECT id, title, completed, owner_id AS ownerId, version
+                         FROM tasks
+                         WHERE owner_id = ?
+                         ORDER BY id ASC
+                         LIMIT ? OFFSET ?`,
+                        [options.ownerId, options.limit, offset],
+                    );
+
+                    tasks = rows.map((row) => ({
+                        id: Number(row.id),
+                        title: String(row.title),
+                        completed: Boolean(row.completed),
+                        ownerId: String(row.ownerId),
+                        version: Number(row.version),
+                    }));
+                }
+            } else {
+                const [rows] = await connection.query<mysql.RowDataPacket[]>(
+                    `SELECT id, title, completed, owner_id AS ownerId, version
+                     FROM tasks
+                     WHERE owner_id = ?
+                     ORDER BY id ASC`,
+                    [options.ownerId],
+                );
+
+                tasks = rows.map((row) => ({
+                    id: Number(row.id),
+                    title: String(row.title),
+                    completed: Boolean(row.completed),
+                    ownerId: String(row.ownerId),
+                    version: Number(row.version),
+                }));
+            }
+
+            await connection.commit();
+
+            return { tasks, total };
+        } catch (error) {
+            await connection.rollback();
+            throw error;
+        } finally {
+            connection.release();
+        }
     }
 
     async update(
         id: number,
         ownerId: string,
-        updates: { title?: string | undefined; completed?: boolean | undefined; version: number },
+        updates: { title?: string | undefined; completed?: boolean | undefined; version?: number | undefined },
     ): Promise<TaskUpdateResult> {
-        const setClauses: string[] = ["version = version + 1"];
-        const params: any[] = [];
+        const connection = await this.pool.getConnection();
 
-        if (updates.title !== undefined) {
-            setClauses.push("title = ?");
-            params.push(updates.title);
-        }
-        if (updates.completed !== undefined) {
-            setClauses.push("completed = ?");
-            params.push(updates.completed);
-        }
+        try {
+            await connection.beginTransaction();
 
-        params.push(id, ownerId, updates.version);
-
-        const [result] = await this.pool.execute<mysql.ResultSetHeader>(
-            `UPDATE tasks
-             SET ${setClauses.join(", ")}
-             WHERE id = ? AND owner_id = ? AND version = ?`,
-            params,
-        );
-
-        if (result.affectedRows === 0) {
-            // Check whether the task exists to distinguish 404 from 409
-            const [checkRows] = await this.pool.execute<mysql.RowDataPacket[]>(
-                `SELECT version FROM tasks WHERE id = ? AND owner_id = ?`,
+            // Lock row using FOR UPDATE to prevent concurrent modifications and mis-reporting
+            const [rows] = await connection.execute<mysql.RowDataPacket[]>(
+                `SELECT id, title, completed, owner_id AS ownerId, version
+                 FROM tasks
+                 WHERE id = ? AND owner_id = ?
+                 FOR UPDATE`,
                 [id, ownerId],
             );
-            if (checkRows.length === 0) {
+
+            const row = rows[0];
+            if (!row) {
+                await connection.rollback();
                 return { status: "NOT_FOUND" };
             }
+
+            const currentVersion = Number(row.version);
+
+            // Optimistic concurrency check when version is provided
+            if (updates.version !== undefined && currentVersion !== updates.version) {
+                await connection.rollback();
+                return {
+                    status: "CONFLICT",
+                    currentVersion,
+                };
+            }
+
+            const nextTitle = updates.title !== undefined ? updates.title : String(row.title);
+            const nextCompleted = updates.completed !== undefined ? updates.completed : Boolean(row.completed);
+            const nextVersion = currentVersion + 1;
+
+            await connection.execute(
+                `UPDATE tasks
+                 SET title = ?, completed = ?, version = ?
+                 WHERE id = ? AND owner_id = ?`,
+                [nextTitle, nextCompleted, nextVersion, id, ownerId],
+            );
+
+            await connection.commit();
+
             return {
-                status: "CONFLICT",
-                currentVersion: Number(checkRows[0]?.version),
+                status: "SUCCESS",
+                task: {
+                    id,
+                    title: nextTitle,
+                    completed: nextCompleted,
+                    ownerId,
+                    version: nextVersion,
+                },
             };
+        } catch (error) {
+            await connection.rollback();
+            throw error;
+        } finally {
+            connection.release();
         }
-
-        const updated = await this.findById(id, ownerId);
-        if (!updated) {
-            return { status: "NOT_FOUND" };
-        }
-        return { status: "SUCCESS", task: updated };
-    }
-
-    async reset(): Promise<void> {
-        await this.pool.query(`TRUNCATE TABLE tasks`);
     }
 }
